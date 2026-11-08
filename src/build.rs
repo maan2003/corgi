@@ -5310,7 +5310,11 @@ fn build_inner(
             String::new()
         };
     let sandbox = match host_platform {
-        HostPlatform::Linux => Sandbox::Linux(setup_linux_sandbox(&store, runtime_paths)?),
+        HostPlatform::Linux => Sandbox::Linux(setup_linux_sandbox(
+            &store,
+            runtime_paths,
+            crate::native_toolchain::find_executable("sh")?,
+        )?),
         HostPlatform::Darwin => Sandbox::Darwin(setup_macos_sandbox(
             &store,
             Path::new(&rustc),
