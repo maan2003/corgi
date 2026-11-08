@@ -10793,7 +10793,23 @@ fn compile(
     };
     // The linker strips only the staging prefix. The remaining path is
     // known before compilation, unlike the eventual dep-info action key.
-    let stage_root = ctx.store.tmp_path("rustc");
+    // rustc reuses incremental codegen only while the output directory stays
+    // the same between sessions, so an incremental compile stages beside its
+    // state, which its lock already makes exclusive. Others stage afresh.
+    let stage_root = match &incr_dir {
+        Some(directory) => {
+            let stage = directory.with_extension("out");
+            match fs::remove_dir_all(&stage) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context("clearing the incremental staging directory")
+                }
+            }
+            stage
+        }
+        None => ctx.store.tmp_path("rustc"),
+    };
     let outdir = debug_directory.as_ref().map_or_else(
         || stage_root.clone(),
         |directory| stage_root.join(directory),
