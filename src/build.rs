@@ -1179,6 +1179,49 @@ mod extra_input_tests {
         fs::remove_dir_all(workspace.parent().unwrap()).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_package_linked_into_the_workspace_labels_its_own_files_by_the_link() {
+        // <workspace>/deps/pkg -> <outside>/pkg, as a path dependency into
+        // /nix/store is: its own files count, the link's neighbours do not.
+        let root = temp_dir();
+        let workspace = root.join("workspace");
+        write(&root, "outside/pkg/Cargo.toml");
+        write(&root, "outside/pkg/fixtures/keys.json");
+        write(&root, "outside/secret.json");
+        fs::create_dir_all(workspace.join("deps")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside/pkg"), workspace.join("deps/pkg")).unwrap();
+        let workspace = dunce::canonicalize(&workspace).unwrap();
+        let package = package("pkg", workspace.join("deps/pkg/Cargo.toml"), None);
+
+        let resolved = ExtraInputs::resolve(
+            &declarations(["fixtures/*.json"]),
+            std::slice::from_ref(&package),
+            [0],
+            &workspace,
+        )
+        .unwrap();
+        assert_eq!(labels(&resolved, 0), ["deps/pkg/fixtures/keys.json"]);
+        assert_eq!(
+            resolved.for_package(0)[0].path,
+            dunce::canonicalize(root.join("outside/pkg/fixtures/keys.json")).unwrap()
+        );
+        assert_eq!(
+            ExtraInputs::resolve(
+                &declarations(["../secret.json"]),
+                &[package],
+                [0],
+                &workspace
+            )
+            .err()
+            .unwrap()
+            .to_string(),
+            "extra-input `../secret.json` of pkg escapes the workspace"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn inputs_outside_the_workspace_are_rejected() {
         let workspace = workspace_with([]);
@@ -2305,6 +2348,13 @@ impl ExtraInputs {
                 continue;
             };
             let root = pkg.root();
+            // A package reached through a symlink (a path dependency into
+            // /nix/store) has its files at canonical paths outside the
+            // workspace: label those by the package's place in the workspace.
+            let linked_root = root
+                .strip_prefix(workspace_root)
+                .ok()
+                .zip(dunce::canonicalize(&root).ok());
             let mut resolved: Vec<ExtraInput> = Vec::new();
             for declared in declared_patterns {
                 let matched = expand_extra_input(&root, declared)?;
@@ -2325,7 +2375,16 @@ impl ExtraInputs {
                     );
                 }
                 for path in files {
-                    let Ok(relative) = path.strip_prefix(workspace_root) else {
+                    let relative = path
+                        .strip_prefix(workspace_root)
+                        .map(Path::to_path_buf)
+                        .or_else(|_| {
+                            let (place, canonical_root) = linked_root.as_ref().ok_or(())?;
+                            Ok::<_, ()>(
+                                place.join(path.strip_prefix(canonical_root).map_err(|_| ())?),
+                            )
+                        });
+                    let Ok(relative) = relative else {
                         bail!(
                             "extra-input `{declared}` of {} escapes the workspace",
                             pkg.name
@@ -11329,6 +11388,11 @@ fn dep_info_package_files(
     allowed_abs: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
     let package_root = normalize_path(package_root);
+    // A package reached through a symlink (a path dependency into /nix/store,
+    // say) has its inputs granted at their canonical paths, while rustc spells
+    // its files from the compile directory, under the link: a file may match
+    // in either spelling.
+    let canonical_root = dunce::canonicalize(&package_root).ok();
     let mut package_files = BTreeSet::new();
     for line in dep.lines() {
         let line = line.trim();
@@ -11355,9 +11419,14 @@ fn dep_info_package_files(
             } else {
                 normalize_path(&compile_dir.join(p))
             };
-            if !allowed_abs
-                .iter()
-                .any(|allowed| resolved.starts_with(allowed))
+            let canonical = dunce::canonicalize(&resolved).ok();
+            if !std::iter::once(&resolved)
+                .chain(canonical.as_ref())
+                .any(|spelling| {
+                    allowed_abs
+                        .iter()
+                        .any(|allowed| spelling.starts_with(allowed))
+                })
             {
                 if p.is_absolute() {
                     bail!(
@@ -11371,6 +11440,10 @@ fn dep_info_package_files(
             }
             if let Ok(relative) = resolved.strip_prefix(&package_root) {
                 package_files.insert(relative.to_path_buf());
+            } else if let (Some(canonical), Some(root)) = (&canonical, &canonical_root) {
+                if let Ok(relative) = canonical.strip_prefix(root) {
+                    package_files.insert(relative.to_path_buf());
+                }
             }
         }
     }
@@ -11462,6 +11535,41 @@ mod dep_info_tests {
             files,
             ["Cargo.toml", "RELEASE_CHANNEL", "src/lib.rs"].map(PathBuf::from)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_reached_through_a_symlink_matches_its_canonical_inputs() {
+        // .nix-deps/dep -> <store>/dep: the inputs are granted at their
+        // canonical paths, rustc reads them under the link.
+        let root = std::env::temp_dir().join(format!("corgi-dep-info-link-{}", std::process::id()));
+        let store = root.join("store/dep");
+        std::fs::create_dir_all(store.join("src")).unwrap();
+        std::fs::write(store.join("src/lib.rs"), "").unwrap();
+        std::fs::write(store.join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir_all(root.join("workspace/.nix-deps")).unwrap();
+        let link = root.join("workspace/.nix-deps/dep");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let canonical = dunce::canonicalize(&store).unwrap();
+        let granted = [canonical.join("src/lib.rs"), canonical.join("Cargo.toml")];
+
+        let files = dep_info_package_files(
+            &format!("output: src/lib.rs {}", link.join("Cargo.toml").display()),
+            &link,
+            &link,
+            &granted,
+        )
+        .unwrap();
+        assert_eq!(files, ["Cargo.toml", "src/lib.rs"].map(PathBuf::from));
+        // Following the link grants nothing beyond what was granted.
+        std::fs::write(store.join("src/other.rs"), "").unwrap();
+        assert!(
+            dep_info_package_files("output: src/other.rs", &link, &link, &granted)
+                .unwrap_err()
+                .to_string()
+                .contains("undeclared input read during compilation")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
