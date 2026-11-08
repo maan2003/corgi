@@ -7,6 +7,8 @@ let
       "clippy"
       "rustfmt"
     ];
+    # The supplied-target-tools test builds for a target that Corgi's Zig does not support.
+    targets = [ "x86_64-linux-android" ];
   };
 in
 pkgs.callPackage ./package.nix {

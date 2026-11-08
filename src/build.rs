@@ -1,5 +1,5 @@
 use crate::meta::{self, Metadata, Package, Target};
-use crate::native_toolchain::{NativeToolchain, SuppliedRust, ToolchainSource};
+use crate::native_toolchain::{NativeToolchain, SuppliedRust, TargetTools, ToolchainSource};
 use crate::platform::executable_name;
 use crate::report::UnitKeyResolution as KeyResolution;
 use crate::sandbox::linux::{host_runtime_paths, setup_linux_sandbox};
@@ -3944,6 +3944,8 @@ struct SelectedToolchain {
     /// Wrapper environment captured for a supplied toolchain; empty when managed.
     native_environment: Vec<(String, String)>,
     supplied_rust: Option<SuppliedRust>,
+    /// The supplied C toolchain for the `--target` platform.
+    target_tools: Option<TargetTools>,
     /// The toolchain's root, with `bin/rustc` and `bin/cargo`.
     rust_toolchain: PathBuf,
 }
@@ -3963,10 +3965,13 @@ fn select_toolchain(
     // Reject invalid toolchain variables before reading the pin: an unpinned
     // project asks the selected toolchain for its channel.
     let source = ToolchainSource::for_build()?;
-    if source == ToolchainSource::Supplied || host_platform == HostPlatform::Linux {
+    let target_tools = TargetTools::from_env()?;
+    if target_tools.is_none()
+        && (source == ToolchainSource::Supplied || host_platform == HostPlatform::Linux)
+    {
         if let Some(target) = target.filter(|target| *target != host) {
             if crate::zig::target(target)?.is_none() {
-                bail!("toolchain does not support target {target} from host {host}; select a supported Zig target");
+                bail!("toolchain does not support target {target} from host {host}; select a supported Zig target, or supply the target's C toolchain with CORGI_TARGET_CC, CORGI_TARGET_CXX, CORGI_TARGET_AR and CORGI_TARGET_LINKER");
             }
         }
     }
@@ -3978,6 +3983,7 @@ fn select_toolchain(
             channel,
             native_environment: Vec::new(),
             supplied_rust: None,
+            target_tools: None,
         });
     }
     if build_std {
@@ -3991,6 +3997,7 @@ fn select_toolchain(
         rust_toolchain: supplied_rust.directory.clone(),
         native_environment,
         supplied_rust: Some(supplied_rust),
+        target_tools,
     })
 }
 
@@ -5059,6 +5066,7 @@ fn build_inner(
         channel,
         native_environment,
         supplied_rust,
+        target_tools,
         rust_toolchain,
     } = select_toolchain(
         &store,
@@ -5069,12 +5077,22 @@ fn build_inner(
         build_std,
         &cargo_config.env,
     )?;
+    if target_tools.is_some()
+        && requested_target
+            .as_deref()
+            .is_none_or(|target| target == host_guess)
+    {
+        bail!("CORGI_TARGET_* name the C toolchain of the --target platform, and this build has no --target other than the host");
+    }
+    let supplies_target = target_tools.is_some();
     let native_toolchain = supplied_rust
         .as_ref()
-        .map(|rust| NativeToolchain::resolve(rust, native_environment.clone()))
+        .map(|rust| NativeToolchain::resolve(rust, native_environment.clone(), target_tools))
         .transpose()?;
+    // A supplied target toolchain takes the place of Zig's.
     let zig_target = requested_target
         .as_deref()
+        .filter(|_| !supplies_target)
         .map(|target| {
             crate::zig::target_requires_zig(&host_guess, target)
                 .map(|required| required.then(|| target.to_string()))
@@ -10655,9 +10673,13 @@ fn compile(
         cmd.arg(f);
     }
     if let Some(native) = ctx.toolchain.supplied() {
-        if unit.host || ctx.target.is_none() || ctx.zig.is_none() {
-            cmd.arg("-C")
-                .arg(format!("linker={}", native.compiler.display()));
+        let linker = match &native.target_tools {
+            Some(tools) if !unit.host => Some(&tools.linker),
+            _ if unit.host || ctx.target.is_none() || ctx.zig.is_none() => Some(&native.compiler),
+            _ => None,
+        };
+        if let Some(linker) = linker {
+            cmd.arg("-C").arg(format!("linker={}", linker.display()));
         }
     }
     for f in lint_flags {
@@ -11004,17 +11026,31 @@ fn build_script_environment<'a>(
         .as_ref()
         .zip(ctx.target.as_deref())
         .filter(|_| !unit.host);
+    let target_tools = ctx
+        .toolchain
+        .supplied()
+        .and_then(|native| native.target_tools.as_ref())
+        .filter(|_| !unit.host);
     if let Some(native) = ctx.toolchain.supplied() {
         if let Some(path) = &native.libclang_path {
             env.push(("LIBCLANG_PATH".into(), path.display().to_string()));
         }
-        if target_zig.is_none() {
+        if target_zig.is_none() && target_tools.is_none() {
             if let Some(arguments) = &native.native_bindgen_arguments {
                 env.push(("BINDGEN_EXTRA_CLANG_ARGS".into(), arguments.clone()));
             }
         }
     }
     env.extend(ctx.config_env.iter().cloned());
+    if let Some(tools) = target_tools {
+        let target_environment = platform.replace('-', "_");
+        for (name, path) in [("CC", &tools.cc), ("CXX", &tools.cxx), ("AR", &tools.ar)] {
+            env.push((
+                format!("{name}_{target_environment}"),
+                path.display().to_string(),
+            ));
+        }
+    }
     if let Some((zig, target)) = target_zig {
         env.retain(|(name, _)| name != "BINDGEN_EXTRA_CLANG_ARGS");
         env.extend(zig.build_script_environment());
@@ -11715,6 +11751,7 @@ mod build_platform_tests {
             environment: Vec::new(),
             libclang_path: None,
             native_bindgen_arguments: None,
+            target_tools: None,
             identity: "closure-hash".into(),
             runtime_paths: Vec::new(),
         });

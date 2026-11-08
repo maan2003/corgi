@@ -19,6 +19,10 @@ mod linux_zig;
 mod supplied_bindgen;
 
 #[cfg(target_os = "linux")]
+#[path = "end_to_end/supplied_target.rs"]
+mod supplied_target;
+
+#[cfg(target_os = "linux")]
 #[test]
 fn linux_supplied_toolchain_builds_runs_and_invalidates_in_an_xdg_store() {
     let directory = TestDirectory::new("linux-hello");

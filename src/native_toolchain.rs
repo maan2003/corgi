@@ -25,6 +25,7 @@ const WRAPPER_ENVIRONMENT: &[&str] = &[
     "DEVELOPER_DIR",
     "SDKROOT",
     "MACOSX_DEPLOYMENT_TARGET",
+    "IPHONEOS_DEPLOYMENT_TARGET",
     "NIX_RUSTFLAGS",
     "NIX_CFLAGS_COMPILE",
     "NIX_CFLAGS_COMPILE_BEFORE",
@@ -104,6 +105,83 @@ impl SuppliedRust {
     }
 }
 
+/// The C toolchain for the platform that `--target` names, when the supplied
+/// host toolchain and Corgi's Zig cannot compile for it: the compilers build
+/// scripts receive as `CC_<target>`, `CXX_<target>` and `AR_<target>`, and
+/// rustc's linker for target units.
+pub struct TargetTools {
+    pub cc: PathBuf,
+    pub cxx: PathBuf,
+    pub ar: PathBuf,
+    pub linker: PathBuf,
+}
+
+const TARGET_TOOLS: [&str; 4] = [
+    "CORGI_TARGET_CC",
+    "CORGI_TARGET_CXX",
+    "CORGI_TARGET_AR",
+    "CORGI_TARGET_LINKER",
+];
+
+impl TargetTools {
+    /// The tools that the `CORGI_TARGET_*` variables name; None when none is set.
+    pub fn from_env() -> Result<Option<Self>> {
+        if TARGET_TOOLS
+            .iter()
+            .all(|variable| std::env::var_os(variable).is_none())
+        {
+            return Ok(None);
+        }
+        let tool = |variable: &str| -> Result<PathBuf> {
+            let path = required_path(variable)?;
+            ensure!(path.is_file(), "{variable} must name an executable");
+            Ok(path)
+        };
+        Ok(Some(Self {
+            cc: tool("CORGI_TARGET_CC")?,
+            cxx: tool("CORGI_TARGET_CXX")?,
+            ar: tool("CORGI_TARGET_AR")?,
+            linker: tool("CORGI_TARGET_LINKER")?,
+        }))
+    }
+
+    fn paths(&self) -> [&Path; 4] {
+        [&self.cc, &self.cxx, &self.ar, &self.linker]
+    }
+
+    /// What the tools read: the directories they sit in, as wrappers find
+    /// files beside themselves, and the Nix store paths that wrapper scripts
+    /// name.
+    fn roots(&self) -> Result<BTreeSet<PathBuf>> {
+        let mut roots = BTreeSet::new();
+        for path in self.paths() {
+            roots.insert(
+                path.parent()
+                    .context("a target tool has no parent directory")?
+                    .to_path_buf(),
+            );
+            let contents = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            if contents.starts_with(b"#!") {
+                let script = String::from_utf8(contents)
+                    .with_context(|| format!("{} is not UTF-8", path.display()))?;
+                // Actions see only their declared inputs, not the host's /usr or /bin.
+                let interpreter = script[2..].split_whitespace().next().unwrap_or_default();
+                ensure!(
+                    !cfg!(target_os = "linux") || interpreter.starts_with("/nix/store/"),
+                    "{} runs with {interpreter}, which builds cannot reach; name an interpreter in the Nix store",
+                    path.display()
+                );
+                roots.extend(
+                    environment_store_roots(&[(String::new(), script)])?
+                        .into_iter()
+                        .filter(|path| path.exists()),
+                );
+            }
+        }
+        Ok(roots)
+    }
+}
+
 pub struct NativeToolchain {
     pub compiler: PathBuf,
     pub compiler_version: String,
@@ -112,6 +190,8 @@ pub struct NativeToolchain {
     pub libclang_path: Option<PathBuf>,
     /// Native header arguments, excluded from Zig target units.
     pub native_bindgen_arguments: Option<String>,
+    /// The C toolchain for the `--target` platform, when supplied.
+    pub target_tools: Option<TargetTools>,
     pub identity: String,
     pub runtime_paths: Vec<PathBuf>,
 }
@@ -128,6 +208,9 @@ impl ToolchainSource {
         if std::env::var_os("CORGI_RUST_TOOLCHAIN").is_some()
             || std::env::var_os("CORGI_CC").is_some()
             || std::env::var_os("CORGI_NATIVE_RUNTIME_ROOTS").is_some()
+            || TARGET_TOOLS
+                .iter()
+                .any(|variable| std::env::var_os(variable).is_some())
         {
             required_path("CORGI_RUST_TOOLCHAIN")?;
             required_path("CORGI_CC")?;
@@ -148,7 +231,11 @@ impl ToolchainSource {
 }
 
 impl NativeToolchain {
-    pub fn resolve(rust: &SuppliedRust, environment: Vec<(String, String)>) -> Result<Self> {
+    pub fn resolve(
+        rust: &SuppliedRust,
+        environment: Vec<(String, String)>,
+        target_tools: Option<TargetTools>,
+    ) -> Result<Self> {
         let compiler = required_path("CORGI_CC")?;
         ensure!(compiler.is_file(), "CORGI_CC must name a Clang executable");
         let compiler_version = output(
@@ -217,6 +304,9 @@ impl NativeToolchain {
                     .filter(|path| path.exists()),
             );
         }
+        if let Some(tools) = &target_tools {
+            roots.extend(tools.roots()?);
+        }
         roots.extend(
             runtime_roots(std::env::var_os("CORGI_NATIVE_RUNTIME_ROOTS").as_deref())
                 .context("parsing CORGI_NATIVE_RUNTIME_ROOTS")?,
@@ -264,10 +354,11 @@ impl NativeToolchain {
         }
         environment.sort();
         let identity = sha256_hex(&serde_json::to_vec(&(
-            "native-toolchain/3",
+            "native-toolchain/4",
             &rust.directory,
             &rust.sysroot,
             &compiler,
+            target_tools.as_ref().map(TargetTools::paths),
             &inputs.identity,
             &environment,
             &libclang_path,
@@ -279,6 +370,7 @@ impl NativeToolchain {
             environment,
             libclang_path,
             native_bindgen_arguments,
+            target_tools,
             identity,
             runtime_paths: inputs.paths,
         })
