@@ -388,6 +388,10 @@ struct ToolRt {
     /// key on this, nothing else does.
     id: String,
     bin: String,
+    /// Executables of a `bins` directory (`value`), each on PATH by name.
+    bins: Vec<String>,
+    /// Nix store closure a sandboxed action must read to run the tool.
+    reads: Vec<PathBuf>,
     packages: Vec<String>,
     targets: Vec<String>,
 }
@@ -1037,6 +1041,24 @@ impl Ctx {
             paths: inputs,
             immutable_source_roots,
         })
+    }
+
+    fn tools_visible_to(&self, package: &str, platform: &str) -> Vec<&ToolRt> {
+        self.tools
+            .iter()
+            .filter(|tool| tool.is_visible_to(package, platform))
+            .collect()
+    }
+
+    /// The tools build-script run `index` sees.
+    fn build_script_tools(&self, index: usize) -> Vec<&ToolRt> {
+        let unit = &self.units[index];
+        let platform = if unit.host {
+            &self.host
+        } else {
+            self.target.as_ref().unwrap_or(&self.host)
+        };
+        self.tools_visible_to(&self.meta.packages[unit.pkg].name, platform)
     }
 
     fn build_script_archive_roots(&self, index: usize) -> Result<Vec<PathBuf>> {
@@ -2212,16 +2234,31 @@ struct TestResult {
 struct ToolSpec {
     #[serde(skip)]
     name: String,
+    /// User-visible version of a downloaded tool. A Nix store tool has none:
+    /// its store path names it.
+    #[serde(default)]
     version: String,
+    #[serde(default)]
     url: String,
+    #[serde(default)]
     sha256: String,
+    /// The executable, relative to the archive root or an absolute path in
+    /// /nix/store. Exactly one of `bin`, `path` and `bins` is set; an absolute
+    /// store path makes the tool its store path instead of a download.
     #[serde(default)]
     bin: String,
     /// Bare executable name exposed on PATH; defaults to the tool's table name.
     #[serde(default)]
     command: Option<String>,
+    /// A file or directory exported through `env`.
     #[serde(default)]
     path: String,
+    /// A directory whose executables all go on PATH under their own names,
+    /// such as a Nix package's `bin`.
+    #[serde(default)]
+    bins: String,
+    /// The variable naming `bin` or `path` to build scripts; `bins` has none.
+    #[serde(default)]
     env: String,
     /// Packages whose actions see and key on this tool; empty = every
     /// build script (right for graph-wide tools like a wasm C compiler).
@@ -2241,6 +2278,50 @@ struct ToolSpec {
 impl ToolSpec {
     fn serves_platform(&self, platform: &str) -> bool {
         self.targets.is_empty() || self.targets.iter().any(|target| target == platform)
+    }
+
+    /// The `bin`, `path` or `bins` location, whichever is set.
+    fn exported(&self) -> &str {
+        [&self.bin, &self.path, &self.bins]
+            .into_iter()
+            .find(|exported| !exported.is_empty())
+            .map_or("", String::as_str)
+    }
+
+    /// The Nix store path holding a store tool; `None` for a download.
+    fn nix_store_path(&self) -> Option<PathBuf> {
+        let exported = Path::new(self.exported());
+        let name = exported
+            .strip_prefix("/nix/store")
+            .ok()?
+            .components()
+            .next()?;
+        matches!(name, std::path::Component::Normal(_)).then(|| Path::new("/nix/store").join(name))
+    }
+
+    /// Where the exported location lives once the tool is provisioned.
+    fn location(&self, store: &Store) -> PathBuf {
+        if Path::new(self.exported()).is_absolute() {
+            return PathBuf::from(self.exported());
+        }
+        store
+            .root
+            .join("tools")
+            .join(format!("{}-{}", self.name, self.version))
+            .join(self.exported())
+    }
+
+    /// The version shown to users: a store tool's store name without its hash.
+    fn display_version(&self) -> String {
+        match self.nix_store_path() {
+            Some(path) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                name.split_once('-')
+                    .map_or(&*name, |(_, rest)| rest)
+                    .to_string()
+            }
+            None => self.version.clone(),
+        }
     }
 }
 
@@ -2555,11 +2636,57 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiToml>> {
         toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
     for (name, t) in &mut parsed.tools {
         t.name.clone_from(name);
-        if t.bin.is_empty() == t.path.is_empty() {
+        if [&t.bin, &t.path, &t.bins]
+            .into_iter()
+            .filter(|exported| !exported.is_empty())
+            .count()
+            != 1
+        {
             bail!(
-                "tool `{}` in {} needs exactly one of `bin` (executable) or `path` (file/dir)",
+                "tool `{}` in {} needs exactly one of `bin` (executable), `path` (file/dir) \
+                 or `bins` (directory of executables)",
                 t.name,
                 p.display()
+            );
+        }
+        if t.bins.is_empty() == t.env.is_empty() {
+            bail!(
+                "tool `{name}` in {} needs `env` with `bin` or `path`, and none with `bins`",
+                p.display()
+            );
+        }
+        if Path::new(t.exported()).is_absolute() {
+            if t.nix_store_path().is_none() {
+                bail!(
+                    "tool `{name}` in {}: an absolute `{}` must lie in a /nix/store path",
+                    p.display(),
+                    t.exported()
+                );
+            }
+            if !(t.version.is_empty()
+                && t.url.is_empty()
+                && t.sha256.is_empty()
+                && t.auth.is_empty())
+            {
+                bail!(
+                    "tool `{name}` in {} is a Nix store path, which is its identity: \
+                     drop `version`, `url`, `sha256` and `auth`",
+                    p.display()
+                );
+            }
+        } else if t.version.is_empty() || t.url.is_empty() {
+            bail!(
+                "tool `{name}` in {} needs a `version` and `url`, or an absolute /nix/store `{}`",
+                p.display(),
+                if t.bins.is_empty() {
+                    if t.bin.is_empty() {
+                        "path"
+                    } else {
+                        "bin"
+                    }
+                } else {
+                    "bins"
+                }
             );
         }
         if let Some(command) = &t.command {
@@ -2869,6 +2996,17 @@ fn ensure_tool_shims(
     environment: &[(String, String)],
 ) -> Result<Option<PathBuf>> {
     let mut commands = BTreeMap::new();
+    for tool in tools {
+        for command in &tool.bins {
+            let executable = Path::new(&tool.value).join(command).display().to_string();
+            if commands
+                .insert(command.as_str(), (tool.id.as_str(), executable))
+                .is_some()
+            {
+                bail!("multiple visible tools provide command `{command}`");
+            }
+        }
+    }
     for tool in tools.iter().filter(|tool| !tool.bin.is_empty()) {
         let executable = environment
             .iter()
@@ -2879,7 +3017,10 @@ fn ensure_tool_shims(
             bail!("tool `{}` executable must be an absolute path", tool.name);
         }
         if commands
-            .insert(tool.command.as_str(), (tool.id.as_str(), executable))
+            .insert(
+                tool.command.as_str(),
+                (tool.id.as_str(), executable.to_string()),
+            )
             .is_some()
         {
             bail!("multiple visible tools provide command `{}`", tool.command);
@@ -2898,7 +3039,7 @@ fn ensure_tool_shims(
     let _staging = compiler_race::Staging(vec![tmp.clone()]);
     fs::create_dir_all(&tmp)?;
     for (command, (_, executable)) in commands {
-        crate::platform::symlink(Path::new(executable), tmp.join(command))
+        crate::platform::symlink(Path::new(&executable), tmp.join(command))
             .with_context(|| format!("creating tool command `{command}`"))?;
     }
     fs::create_dir_all(dir.parent().unwrap())?;
@@ -2912,9 +3053,45 @@ fn ensure_tool_shims(
     Ok(Some(dir))
 }
 
+/// Names of the executable files in `directory`, sorted, following symlinks.
+fn directory_executables(directory: &Path) -> Result<Vec<String>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut names = Vec::new();
+    for entry in
+        fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?
+    {
+        let entry = entry?;
+        let metadata = fs::metadata(entry.path())
+            .with_context(|| format!("reading {}", entry.path().display()))?;
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            names.push(
+                entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|name| anyhow::anyhow!("non-UTF-8 executable name {name:?}"))?,
+            );
+        }
+    }
+    if names.is_empty() {
+        bail!("{} holds no executables", directory.display());
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// Fetch + verify + unpack a pinned tool into the store (atomic, lock-free).
 fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
-    let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
+    let exported = t.exported();
+    if t.nix_store_path().is_some() {
+        // Nix provides it, immutable and named by content: nothing to fetch.
+        if !Path::new(exported).exists() {
+            bail!(
+                "tool {}: {exported} does not exist; realise it first (nix build or nix-store --realise)",
+                t.name
+            );
+        }
+        return Ok(PathBuf::from(exported));
+    }
     let dest = store
         .root
         .join("tools")
@@ -3057,6 +3234,7 @@ fn pinned_macos_tool(
             bin: String::new(),
             command: None,
             path: exported.into(),
+            bins: String::new(),
             env: String::new(),
             packages: Vec::new(),
             targets: Vec::new(),
@@ -3184,6 +3362,7 @@ fn ensure_zig_executable(store: &Store, host: &str) -> Result<PathBuf> {
         bin: format!("{archive_root}/zig"),
         command: None,
         path: String::new(),
+        bins: String::new(),
         env: String::new(),
         packages: Vec::new(),
         targets: Vec::new(),
@@ -5982,35 +6161,52 @@ fn build_inner(
             continue;
         }
         ensure_tool(&store, t)?;
-        let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
-        let tool_path = store
-            .root
-            .join("tools")
-            .join(format!("{}-{}", t.name, t.version))
-            .join(exported);
+        let tool_path = t.location(&store);
+        // A download lives in the store, which every sandbox reads; a Nix
+        // store tool needs its closure. Its store path already names that
+        // closure, so the path alone keys it.
+        let reads = match t.nix_store_path() {
+            Some(root) => {
+                crate::native_toolchain::inputs::resolve(&[root])
+                    .with_context(|| format!("resolving the Nix closure of tool {}", t.name))?
+                    .paths
+            }
+            None => Vec::new(),
+        };
+        let bins = if t.bins.is_empty() {
+            Vec::new()
+        } else {
+            directory_executables(&tool_path)
+                .with_context(|| format!("listing executables of tool {}", t.name))?
+        };
         let scope = if t.packages.is_empty() {
             String::new()
         } else {
             format!(" (packages {:?})", t.packages)
         };
-        status!(
-            "Using",
-            "tool {} {} -> ${}{scope}",
-            t.name,
-            t.version,
-            t.env
-        );
+        let version = t.display_version();
+        if bins.is_empty() {
+            status!("Using", "tool {} {version} -> ${}{scope}", t.name, t.env);
+        } else {
+            status!(
+                "Using",
+                "tool {} {version} -> {} commands on PATH{scope}",
+                t.name,
+                bins.len()
+            );
+        }
         // The setting's own identity: exactly the scoped actions key
         // on it, so a pin edit has exactly the declared blast radius.
         let id = sha256_hex(
             format!(
-                "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 t.name,
                 t.version,
                 t.url,
                 t.sha256,
                 t.bin,
                 t.path,
+                t.bins,
                 t.env,
                 t.command.as_deref().unwrap_or(&t.name)
             )
@@ -6018,12 +6214,14 @@ fn build_inner(
         );
         tools_rt.push(ToolRt {
             name: t.name.clone(),
-            version: t.version.clone(),
+            version,
             env: t.env.clone(),
             value: tool_path.display().to_string(),
             command: t.command.clone().unwrap_or_else(|| t.name.clone()),
             id,
             bin: t.bin.clone(),
+            bins,
+            reads,
             packages: t.packages.clone(),
             targets: t.targets.clone(),
         });
@@ -10213,6 +10411,8 @@ mod tool_scope_tests {
             command: "ghostty".into(),
             id: "pin".into(),
             bin: String::new(),
+            bins: Vec::new(),
+            reads: Vec::new(),
             packages: vec!["terminal".into()],
             targets: vec!["x86_64-unknown-linux-gnu".into()],
         };
@@ -10410,6 +10610,8 @@ fn compile(
     let self_pipelined = is_pipelined(ctx, uidx);
     let default_bs = BuildScriptOut::default();
     let mut bs: &BuildScriptOut = &default_bs;
+    // Build-script runs whose link-search paths this compile passes.
+    let mut link_sources: Vec<usize> = Vec::new();
     let mut out_key = String::new();
     let mut externs: Vec<(String, String)> = Vec::new();
     for d in &unit.deps {
@@ -10438,6 +10640,7 @@ fn compile(
                 bs = b;
                 out_key = r.action.key.clone();
             }
+            link_sources.push(d.unit);
         }
     }
     externs.sort();
@@ -10470,6 +10673,7 @@ fn compile(
                             .as_ref()
                             .context("native build script OUT_DIR archive missing")?;
                         ctx.materialize_out_dir(&r.action.key, archive)?;
+                        link_sources.push(i);
                     }
                     for s in &b.link_search {
                         if !link_search.contains(s) {
@@ -10595,8 +10799,21 @@ fn compile(
             allowed_inputs.push(conf.clone());
         }
     }
+    // A library a build script found in a Nix store tool, passed by its
+    // link-search path (keyed in the build script's output), is read here.
+    let tool_reads = link_sources
+        .iter()
+        .flat_map(|&index| ctx.build_script_tools(index))
+        .flat_map(|tool| &tool.reads)
+        .collect::<BTreeSet<_>>();
     allowed_inputs.extend(package_inputs.paths.iter().cloned());
-    let mut reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
+    allowed_inputs.extend(tool_reads.iter().map(|path| (*path).clone()));
+    let mut reads: Vec<&Path> = package_inputs
+        .paths
+        .iter()
+        .chain(tool_reads.iter().copied())
+        .map(PathBuf::as_path)
+        .collect();
     if clippy_action {
         if let Some(conf) = &ctx.clippy_conf {
             reads.push(conf.as_path());
@@ -11114,12 +11331,8 @@ fn build_script_environment<'a>(
     }
     // Scoped settings: only the tools and env probes naming this package
     // reach it.
-    let visible_tools = ctx
-        .tools
-        .iter()
-        .filter(|tool| tool.is_visible_to(&pkg.name, &platform))
-        .collect::<Vec<_>>();
-    for tool in &visible_tools {
+    let visible_tools = ctx.tools_visible_to(&pkg.name, &platform);
+    for tool in visible_tools.iter().filter(|tool| !tool.env.is_empty()) {
         env.push((tool.env.clone(), tool.value.clone()));
     }
     for (name, value, packages, profiles) in &ctx.env_probes {
@@ -11250,7 +11463,12 @@ fn run_build_script(
     // Drop partial OUT_DIR before releasing its lock, including on cancellation.
     let mut unfinished = compiler_race::Staging(vec![final_parent.clone()]);
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::BuildScriptRun)?;
-    let reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
+    let reads: Vec<&Path> = package_inputs
+        .paths
+        .iter()
+        .chain(visible_tools.iter().flat_map(|tool| &tool.reads))
+        .map(PathBuf::as_path)
+        .collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
     let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes)?;
     cmd.current_dir(&pkg_root);
