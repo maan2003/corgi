@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-pub(super) struct RuntimeInputs {
+pub(crate) struct RuntimeInputs {
     pub paths: Vec<PathBuf>,
     pub identity: String,
 }
@@ -22,7 +22,7 @@ pub(super) struct RuntimeInputs {
 /// The caller must keep these inputs unchanged until the build finishes. Root
 /// aliases are projected at both names; relative links must retain their meaning
 /// under that projection. Nix is needed only when a root or interior link uses it.
-pub(super) fn resolve(roots: &[PathBuf]) -> Result<RuntimeInputs> {
+pub(crate) fn resolve(roots: &[PathBuf]) -> Result<RuntimeInputs> {
     let policy = PathPolicy::new();
     let mut paths = BTreeSet::new();
     let mut declared = BTreeMap::new();

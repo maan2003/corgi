@@ -22,19 +22,31 @@ use crate::store::{sha256_file, sha256_hex, Store};
 pub struct LinuxSandbox {
     pub executable: PathBuf,
     pub runtime_paths: Vec<PathBuf>,
+    /// The toolchain's shell, a runtime path, also provided at /bin/sh.
+    pub shell: PathBuf,
 }
 
-pub fn setup_linux_sandbox(store: &Store, mut runtime_paths: Vec<PathBuf>) -> Result<LinuxSandbox> {
+pub fn setup_linux_sandbox(
+    store: &Store,
+    mut runtime_paths: Vec<PathBuf>,
+    shell: PathBuf,
+) -> Result<LinuxSandbox> {
     ensure!(
         cfg!(target_os = "linux"),
         "Bubblewrap sandboxing requires Linux"
     );
     let executable = crate::native_toolchain::find_executable("bwrap")
         .context("Linux builds require Bubblewrap (bwrap) on PATH")?;
+    ensure!(
+        runtime_paths.iter().any(|path| shell.starts_with(path)),
+        "the shell {} is not a sandbox runtime path",
+        shell.display()
+    );
     runtime_paths.push(store.root.clone());
     Ok(LinuxSandbox {
         executable,
         runtime_paths,
+        shell,
     })
 }
 
@@ -208,6 +220,13 @@ impl LinuxSandbox {
                 }
                 mounts.insert(destination, Mount::ReadOnly(grant.source.clone()));
             }
+        }
+        // make and autoconf run /bin/sh by that name (CMake's Makefiles set
+        // SHELL = /bin/sh). A host whose PATH lacks /bin, like a Nix shell,
+        // grants its shell elsewhere: link the keyed shell there.
+        let bin_sh = Path::new("/bin/sh");
+        if !mounts.keys().any(|path| bin_sh.starts_with(path)) {
+            mounts.insert(bin_sh.to_path_buf(), Mount::Symlink(self.shell.clone()));
         }
         let mut source_roots = BTreeMap::new();
         for grant in &reads {
@@ -574,6 +593,39 @@ mod tests {
     }
 
     #[test]
+    fn the_toolchain_shell_is_bin_sh_unless_the_runtime_grants_one() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let workspace = fixture.directory("workspace")?;
+        let linked = arguments(&fixture.sandbox().command("sh", &workspace, &[], &[])?);
+        assert!(contains(
+            &linked,
+            &[
+                "--symlink".as_ref(),
+                "/toolchain/bin/sh".as_ref(),
+                "/bin/sh".as_ref()
+            ]
+        ));
+        // A host /bin on PATH already grants /bin/sh under its own name.
+        if Path::new("/bin/sh").exists() {
+            let sandbox = LinuxSandbox {
+                runtime_paths: vec![PathBuf::from("/bin/sh")],
+                ..fixture.sandbox()
+            };
+            let granted = arguments(&sandbox.command("sh", &workspace, &[], &[])?);
+            assert!(!granted.contains(&OsString::from("--symlink")));
+            assert!(contains(
+                &granted,
+                &[
+                    "--ro-bind".as_ref(),
+                    fs::canonicalize("/bin/sh")?.as_os_str(),
+                    "/bin/sh".as_ref()
+                ]
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn source_exclusions_are_absent_including_nested_git_and_symlinks() -> Result<()> {
         let fixture = Fixture::new()?;
         let source = fixture.directory("source with spaces")?;
@@ -909,6 +961,7 @@ mod tests {
             LinuxSandbox {
                 executable: PathBuf::from("/bwrap"),
                 runtime_paths: Vec::new(),
+                shell: PathBuf::from("/toolchain/bin/sh"),
             }
         }
     }

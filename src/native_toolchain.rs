@@ -4,7 +4,7 @@
 //! environment are inputs to the build, not ambient executable search state.
 //! Platform build integration selects a sandbox separately from the toolchain.
 
-mod inputs;
+pub(crate) mod inputs;
 
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
